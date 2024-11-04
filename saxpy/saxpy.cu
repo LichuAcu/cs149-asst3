@@ -82,16 +82,24 @@ void saxpyCuda(int N, float alpha, float* xarray, float* yarray, float* resultar
     //
     // CS149 TODO: copy input arrays to the GPU using cudaMemcpy
     //
-
+    cudaMalloc(&device_x, sizeof(float) * N);
+    cudaMalloc(&device_y, sizeof(float) * N);
+    cudaMalloc(&device_result, sizeof(float) * N);
+    cudaMemcpy(device_x, xarray, sizeof(float) * N, cudaMemcpyHostToDevice);
+    cudaMemcpy(device_y, yarray, sizeof(float) * N, cudaMemcpyHostToDevice);
    
+    double kernelStartTime = CycleTimer::currentSeconds();
     // run CUDA kernel. (notice the <<< >>> brackets indicating a CUDA
     // kernel launch) Execution on the GPU occurs here.
     saxpy_kernel<<<blocks, threadsPerBlock>>>(N, alpha, device_x, device_y, device_result);
+    cudaDeviceSynchronize();
+    double kernelEndTime = CycleTimer::currentSeconds();
+    printf("Kernel time: %.3f ms\n", 1000.f * (kernelEndTime - kernelStartTime));
 
     //
     // CS149 TODO: copy result from GPU back to CPU using cudaMemcpy
     //
-
+    cudaMemcpy(resultarray, device_result, sizeof(float) * N, cudaMemcpyDeviceToHost);
     
     // end timing after result has been copied back into host memory
     double endTime = CycleTimer::currentSeconds();
@@ -108,7 +116,7 @@ void saxpyCuda(int N, float alpha, float* xarray, float* yarray, float* resultar
     //
     // CS149 TODO: free memory buffers on the GPU using cudaFree
     //
-    
+    cudaFree(device_x);
 }
 
 void printCudaInfo() {
@@ -130,6 +138,7 @@ void printCudaInfo() {
         printf("   Global mem: %.0f MB\n",
                static_cast<float>(deviceProps.totalGlobalMem) / (1024 * 1024));
         printf("   CUDA Cap:   %d.%d\n", deviceProps.major, deviceProps.minor);
+        printf("   SIMT size:  %d\n", deviceProps.warpSize);
     }
     printf("---------------------------------------------------------\n");
 }
