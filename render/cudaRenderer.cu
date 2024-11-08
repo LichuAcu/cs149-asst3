@@ -13,6 +13,24 @@
 #include "noise.h"
 #include "sceneLoader.h"
 #include "util.h"
+#include "circleBoxTest.cu_inl"
+#define DEBUG
+
+#ifdef DEBUG
+#define cudaCheckError(ans) { cudaAssert((ans), __FILE__, __LINE__); }
+inline void cudaAssert(cudaError_t code, const char *file, int line, bool abort=true)
+{
+   if (code != cudaSuccess)
+   {
+      fprintf(stderr, "CUDA Error: %s at %s:%d\n",
+        cudaGetErrorString(code), file, line);
+      if (abort) exit(code);
+   }
+}
+#else
+#define cudaCheckError(ans) ans
+#endif
+
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
@@ -31,6 +49,8 @@ struct GlobalConstants {
     int imageWidth;
     int imageHeight;
     float* imageData;
+
+    unsigned int* cellFlags;
 };
 
 // Global variable that is in scope, but read-only, for all cuda
@@ -647,17 +667,66 @@ __global__ void kernelRenderPixels() {
     float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * cuConstRendererParams.imageWidth + pixelX)]);
 
     float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
-                                         invHeight * (static_cast<float>(pixelY) + 0.5f));
+        invHeight * (static_cast<float>(pixelY) + 0.5f));
 
     for (int circleIndex = 0; circleIndex < cuConstRendererParams.numCircles; circleIndex++) {
-        float3 p = *(float3*)(&cuConstRendererParams.position[3 * circleIndex]);
-        shadePixel(circleIndex, pixelCenterNorm, p, imgPtr);
+        float3  p = *(float3*)(&cuConstRendererParams.position[3 * circleIndex]);
+        shadePixel(circleIndex, pixelCenterNorm, p, imgPtr);    
     }                                   
+}
+
+#define CELL_SIDE 32
+
+__global__ void kernelComputeCellCircleLists(unsigned int* globalFlags) {
+    // Declare dynamic shared memory array (size specified at launch time)
+    extern __shared__ unsigned int flags[];
+
+    // Convert 2D thread index to 1D
+    int threadId = threadIdx.y * blockDim.x + threadIdx.x;
+    int totalThreadsInBlock = blockDim.x * blockDim.y;
+
+    // Initialize flags to 0
+    if (threadId < (cuConstRendererParams.numCircles + 31) / 32) {
+        flags[threadId] = 0;
+    }
+    __syncthreads();
+
+    // Each thread checks some circles
+    for (int i = threadId; i < cuConstRendererParams.numCircles; i += totalThreadsInBlock) {
+        float3 p = make_float3(cuConstRendererParams.position[3*i], cuConstRendererParams.position[3*i+1], cuConstRendererParams.position[3*i+2]);
+        
+        float rad = cuConstRendererParams.radius[i];
+
+        float invWidth = 1.f / cuConstRendererParams.imageWidth;
+        float invHeight = 1.f / cuConstRendererParams.imageHeight;
+
+        float cellLeft = blockIdx.x * CELL_SIDE * invWidth;
+        float cellBottom = blockIdx.y * CELL_SIDE * invHeight;
+
+        // Check if circle overlaps this cell
+        if (circleInBoxConservative(p.x, p.y, rad,
+            cellLeft, cellLeft + (CELL_SIDE * invWidth),
+            cellBottom + (CELL_SIDE * invHeight), cellBottom)) {
+            unsigned int mask = 1u << (i % 32);
+            atomicOr(&flags[i / 32], mask);    
+        }
+    }
+    __syncthreads();
+
+    
+
+    // At the end of the kernel, store flags in global memory
+    if (threadId == 0) {
+        int cellIndex = blockIdx.y * gridDim.x + blockIdx.x;
+        int flagsPerCell = (cuConstRendererParams.numCircles + 31) / 32;
+        for (int i = 0; i < flagsPerCell; i++) {
+            globalFlags[cellIndex * flagsPerCell + i] = flags[i];
+        }
+    }
 }
 
 void
 CudaRenderer::render() {
-
     // 256 threads per block is a healthy number
     dim3 blockDim(16, 16, 1);
     dim3 gridDim(
@@ -666,4 +735,62 @@ CudaRenderer::render() {
 
     kernelRenderPixels<<<gridDim, blockDim>>>();
     cudaDeviceSynchronize();
+
+    dim3 cellBlockDim(CELL_SIDE, CELL_SIDE, 1);
+    dim3 cellGridDim(
+        (image->width + CELL_SIDE - 1) / CELL_SIDE,
+        (image->height + CELL_SIDE - 1) / CELL_SIDE,
+    1);
+    
+    // Allocate memory for flags
+    unsigned int* deviceFlags;
+    int flagsPerCell = (numCircles + 31) / 32;
+    int totalCells = cellGridDim.x * cellGridDim.y;
+    cudaCheckError(cudaMalloc(&deviceFlags, sizeof(unsigned int) * flagsPerCell * totalCells));
+
+    // Calculate shared memory size needed for flags
+    int flagsSize = ((numCircles + 31) / 32) * sizeof(unsigned int);
+
+    kernelComputeCellCircleLists<<<cellGridDim, cellBlockDim, flagsSize>>>(deviceFlags);
+    cudaDeviceSynchronize();
+
+    // Copy flags back to host
+    unsigned int* hostFlags = new unsigned int[flagsPerCell * totalCells];
+    cudaCheckError(cudaMemcpy(hostFlags, deviceFlags, sizeof(unsigned int) * flagsPerCell * totalCells, cudaMemcpyDeviceToHost));
+    
+    // Add error checking
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("Kernel launch failed: %s\n", cudaGetErrorString(err));
+        return;
+    }
+
+    // Print flags for each cell
+    for (int y = 0; y < cellGridDim.y; y++) {
+        for (int x = 0; x < cellGridDim.x; x++) {
+            int cellIndex = y * cellGridDim.x + x;
+            printf("Cell [%d,%d] flags:", x, y);
+            for (int i = 0; i < flagsPerCell; i++) {
+                printf(" %08x", hostFlags[cellIndex * flagsPerCell + i]);
+            }
+            printf("\n");
+        }
+    }
+
+    printf("Image dimensions: width=%d, height=%d\n", image->width, image->height);
+    printf("Number of circles: %d\n", numCircles);
+    for (int i = 0; i < numCircles; i++) {
+        printf("Circle %d: position=(%f, %f, %f), radius=%f\n", i, position[3*i], position[3*i+1], position[3*i+2], radius[i]);
+    }
+
+    printf("flagsSize: %d\n", flagsSize);
+
+    printf("Launching kernelComputeCellCircleLists with grid(%d,%d), block(%d,%d)\n", 
+           cellGridDim.x, cellGridDim.y, cellBlockDim.x, cellBlockDim.y);
+    
+    printf("flagsPerCell: %d, totalCells: %d\n", flagsPerCell, totalCells);
+
+    // Cleanup
+    delete[] hostFlags;
+    cudaFree(deviceFlags);
 }
