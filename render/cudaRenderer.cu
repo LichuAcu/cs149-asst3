@@ -747,18 +747,10 @@ __global__ void kernelComputeAndProcessCircles(int* currentChunk) {
     }
     __syncthreads();
 
-    // TODO (LichuAcu): Find a better way to do this
     // Write sentinel value at the end
     if (threadId == 0) {
-        // Add sentinel after the last valid circle
-        unsigned int lastValidIndex = 0;
-        for (int i = SCAN_BLOCK_DIM - 1; i >= 0; i--) {
-            if (flags[i] == 1) {
-                lastValidIndex = scanOutput[i] + 1;  // Position after last circle
-                break;
-            }
-        }
-        circleIds[lastValidIndex] = SENTINEL_VALUE;
+        unsigned int sentinelIndex = scanOutput[SCAN_BLOCK_DIM-1] + flags[SCAN_BLOCK_DIM-1];
+        circleIds[sentinelIndex] = SENTINEL_VALUE;
     } 
     
     __syncthreads();
