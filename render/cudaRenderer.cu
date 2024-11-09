@@ -678,10 +678,14 @@ __global__ void kernelRenderPixels() {
         shadePixel(circleIndex, pixelCenterNorm, p, imgPtr);    
     }                                   
 }
-// __device__ int currentChunk[MAX_CELLS_X][MAX_CELLS_Y];
+
+#define MAX_CELLS_X 1024
+#define MAX_CELLS_Y 1024
+
 #define SENTINEL_VALUE 0xFFFFFFFF
 
-__global__ void kernelComputeAndProcessCircles(unsigned int* globalFlags, unsigned int* globalScan, unsigned int* globalCircleIds) {
+// __global__ void kernelComputeAndProcessCircles(int* currentChunk, unsigned int* globalFlags, unsigned int* globalScan, unsigned int* globalCircleIds) {
+__global__ void kernelComputeAndProcessCircles(int* currentChunk) {
     extern __shared__ unsigned int sharedMemory[];
     
     // Divide shared memory into sections
@@ -694,7 +698,7 @@ __global__ void kernelComputeAndProcessCircles(unsigned int* globalFlags, unsign
     // Convert 2D thread index to 1D
     int threadId = threadIdx.y * blockDim.x + threadIdx.x;
     // int totalThreadsInBlock = blockDim.x * blockDim.y;
-    
+
     // Initialize flags to 0
     if (threadId < SCAN_BLOCK_DIM) {
         flags[threadId] = 0;
@@ -702,7 +706,10 @@ __global__ void kernelComputeAndProcessCircles(unsigned int* globalFlags, unsign
     __syncthreads();
 
     // Calculate starting circle for this chunk
-    int startCircle = blockIdx.z * SCAN_BLOCK_DIM;  // e.g., 0, 1024, 2048, ...
+    int startCircle = blockIdx.z * SCAN_BLOCK_DIM;  // i.e., 0, SCAN_BLOCK_DIM, SCAN_BLOCK_DIM * 2, ...
+
+    float invWidth = 1.f / cuConstRendererParams.imageWidth;
+    float invHeight = 1.f / cuConstRendererParams.imageHeight;
     
     // Each thread processes one circle in the chunk
     int circleIndex = startCircle + threadId;
@@ -713,8 +720,6 @@ __global__ void kernelComputeAndProcessCircles(unsigned int* globalFlags, unsign
             cuConstRendererParams.position[3*circleIndex+2]);
         
         float rad = cuConstRendererParams.radius[circleIndex];
-        float invWidth = 1.f / cuConstRendererParams.imageWidth;
-        float invHeight = 1.f / cuConstRendererParams.imageHeight;
 
         float cellLeft = blockIdx.x * CELL_SIDE * invWidth;
         float cellBottom = blockIdx.y * CELL_SIDE * invHeight;
@@ -740,59 +745,90 @@ __global__ void kernelComputeAndProcessCircles(unsigned int* globalFlags, unsign
             circleIds[scanOutput[threadId]] = circleIndex;
         }
     }
+    __syncthreads();
 
+    // TODO (LichuAcu): Find a better way to do this
     // Write sentinel value at the end
     if (threadId == 0) {
-        // If the last two scan outputs are different, then all circles are in this cell so 
-        // we don't need a sentinel value
-        if (scanOutput[SCAN_BLOCK_DIM - 1] == scanOutput[SCAN_BLOCK_DIM - 2]) {
-            unsigned int sentinelIndex = scanOutput[SCAN_BLOCK_DIM - 1];
-            circleIds[sentinelIndex] = SENTINEL_VALUE;  // Maximum unsigned int as sentinel
+        // Add sentinel after the last valid circle
+        unsigned int lastValidIndex = 0;
+        for (int i = SCAN_BLOCK_DIM - 1; i >= 0; i--) {
+            if (flags[i] == 1) {
+                lastValidIndex = scanOutput[i] + 1;  // Position after last circle
+                break;
+            }
         }
-    }    
+        circleIds[lastValidIndex] = SENTINEL_VALUE;
+    } 
     
     __syncthreads();
 
-    // Store both flags and scan results in global memory
-    if (threadId == 0) {
-        int cellIndex = blockIdx.y * gridDim.x + blockIdx.x;
-        int chunkOffset = cellIndex * gridDim.z * SCAN_BLOCK_DIM + blockIdx.z * SCAN_BLOCK_DIM;
+    int cellIndex = blockIdx.y * gridDim.x + blockIdx.x;
+
+    // // Store both flags and scan results in global memory
+    // if (threadId == 0) {
+    //     int chunkOffset = cellIndex * gridDim.z * SCAN_BLOCK_DIM + blockIdx.z * SCAN_BLOCK_DIM;
         
-        for (int i = 0; i < SCAN_BLOCK_DIM; i++) {
-            globalFlags[chunkOffset + i] = flags[i];
-            globalScan[chunkOffset + i] = scanOutput[i];
-            globalCircleIds[chunkOffset + i] = circleIds[i];
-        }
-    }
-    __syncthreads();
-    
-    // // Part 2: Process in order
-    // if (threadIdx.x == 0 && threadIdx.y == 0) {
-    //     while (atomicCAS(&currentChunk[blockIdx.x][blockIdx.y], 
-    //                     blockIdx.z, 
-    //                     blockIdx.z) != blockIdx.z) {
-    //         // Spin wait
+    //     for (int i = 0; i < SCAN_BLOCK_DIM; i++) {
+    //         // globalFlags[chunkOffset + i] = flags[i];
+    //         // globalScan[chunkOffset + i] = scanOutput[i];
+    //         // globalCircleIds[chunkOffset + i] = circleIds[i];
     //     }
     // }
     // __syncthreads();
     
-    // // Process flags
-    // // ... processing code ...
+    // Part 2: Process in order
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        while (atomicCAS(&currentChunk[cellIndex], 
+                        blockIdx.z, 
+                        blockIdx.z) != blockIdx.z) {
+            // Spin wait
+        }
+    }
+    // __syncthreads();
     
-    // if (threadIdx.x == 0 && threadIdx.y == 0) {
-    //     atomicAdd(&currentChunk[blockIdx.x][blockIdx.y], 1);
-    // }
+    // Calculate pixel coordinates for this thread
+    int pixelX = blockIdx.x * CELL_SIDE + threadIdx.x;
+    int pixelY = blockIdx.y * CELL_SIDE + threadIdx.y;
+    
+    if (pixelX >= cuConstRendererParams.imageWidth || 
+        pixelY >= cuConstRendererParams.imageHeight)
+        return;
+
+    float2 pixelCenterNorm = make_float2(
+        invWidth * (static_cast<float>(pixelX) + 0.5f),
+        invHeight * (static_cast<float>(pixelY) + 0.5f));
+    
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * cuConstRendererParams.imageWidth + pixelX)]);
+
+    // Process circles in order
+    for (int i = 0; i < SCAN_BLOCK_DIM; i++) {
+        unsigned int circleIndex = circleIds[i];
+        
+        // Stop if we hit the sentinel or processed all circles
+        if (circleIndex == SENTINEL_VALUE)
+            break;
+            
+        float3 p = *(float3*)(&cuConstRendererParams.position[3 * circleIndex]);
+        shadePixel(circleIndex, pixelCenterNorm, p, imgPtr);
+    }
+
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        atomicAdd(&currentChunk[cellIndex], 1);
+    }
 }
+
+__constant__ int* d_currentChunk;
 
 void CudaRenderer::render() {
     // 256 threads per block is a healthy number
-    dim3 blockDim(16, 16, 1);
-    dim3 gridDim(
-        (image->width + blockDim.x - 1) / blockDim.x,
-        (image->height + blockDim.y - 1) / blockDim.y);
+    // dim3 blockDim(16, 16, 1);
+    // dim3 gridDim(
+    //     (image->width + blockDim.x - 1) / blockDim.x,
+    //     (image->height + blockDim.y - 1) / blockDim.y);
 
-    kernelRenderPixels<<<gridDim, blockDim>>>();
-    cudaDeviceSynchronize();
+    // kernelRenderPixels<<<gridDim, blockDim>>>();
+    // cudaDeviceSynchronize();
 
     // Setup dimensions for cell processing
     dim3 cellBlockDim(CELL_SIDE, CELL_SIDE, 1);  // CELL_SIDE x CELL_SIDE threads per block, one per pixel
@@ -810,18 +846,26 @@ void CudaRenderer::render() {
                         SCAN_BLOCK_DIM * sizeof(unsigned int);          // circle IDs
 
     // Allocate memory for debugging flags
-    unsigned int* deviceFlags;
-    unsigned int* deviceScan;
-    unsigned int* deviceCircleIds;
-    int totalFlags = cellGridDim.x * cellGridDim.y * cellGridDim.z * SCAN_BLOCK_DIM;
-    cudaCheckError(cudaMalloc(&deviceFlags, sizeof(unsigned int) * totalFlags));
-    cudaCheckError(cudaMalloc(&deviceScan, sizeof(unsigned int) * totalFlags));
-    cudaCheckError(cudaMalloc(&deviceCircleIds, sizeof(unsigned int) * totalFlags));
+    // unsigned int* deviceFlags;
+    // unsigned int* deviceScan;
+    // unsigned int* deviceCircleIds;
+    // int totalFlags = cellGridDim.x * cellGridDim.y * cellGridDim.z * SCAN_BLOCK_DIM;
+    // cudaCheckError(cudaMalloc(&deviceFlags, sizeof(unsigned int) * totalFlags));
+    // cudaCheckError(cudaMalloc(&deviceScan, sizeof(unsigned int) * totalFlags));
+    // cudaCheckError(cudaMalloc(&deviceCircleIds, sizeof(unsigned int) * totalFlags));
 
+    // Allocate and initialize currentChunk array
+    int* deviceCurrentChunk;
+    int numCellsX = (image->width + CELL_SIDE - 1) / CELL_SIDE;
+    int numCellsY = (image->height + CELL_SIDE - 1) / CELL_SIDE;
+    cudaCheckError(cudaMalloc(&deviceCurrentChunk, numCellsX * numCellsY * sizeof(int)));
+    cudaCheckError(cudaMemset(deviceCurrentChunk, 0, numCellsX * numCellsY * sizeof(int)));  // Initialize to 0
+    cudaCheckError(cudaMemcpyToSymbol(d_currentChunk, &deviceCurrentChunk, sizeof(int*)));
     // // Initialize currentChunk array to 0
     // cudaCheckError(cudaMemset(currentChunk, 0, MAX_CELLS_X * MAX_CELLS_Y * sizeof(int)));
 
-    kernelComputeAndProcessCircles<<<cellGridDim, cellBlockDim, sharedMemSize>>>(deviceFlags, deviceScan, deviceCircleIds);
+    // kernelComputeAndProcessCircles<<<cellGridDim, cellBlockDim, sharedMemSize>>>(deviceCurrentChunk, deviceFlags, deviceScan, deviceCircleIds);
+    kernelComputeAndProcessCircles<<<cellGridDim, cellBlockDim, sharedMemSize>>>(deviceCurrentChunk);
     cudaDeviceSynchronize();
 
     // Add error checking
@@ -830,61 +874,66 @@ void CudaRenderer::render() {
         printf("Kernel launch failed: %s\n", cudaGetErrorString(err));
         return;
     }
-    printf("Kernel compute and process circles launched successfully\n");
+    // printf("Kernel compute and process circles launched successfully\n");
 
     // For debugging, copy both arrays back
-    unsigned int* hostFlags = new unsigned int[totalFlags];
-    unsigned int* hostScan = new unsigned int[totalFlags];
-    unsigned int* hostCircleIds = new unsigned int[totalFlags];
-    cudaCheckError(cudaMemcpy(hostFlags, deviceFlags, sizeof(unsigned int) * totalFlags, cudaMemcpyDeviceToHost));
-    cudaCheckError(cudaMemcpy(hostScan, deviceScan, sizeof(unsigned int) * totalFlags, cudaMemcpyDeviceToHost));
-    cudaCheckError(cudaMemcpy(hostCircleIds, deviceCircleIds, sizeof(unsigned int) * totalFlags, cudaMemcpyDeviceToHost));
+    // unsigned int* hostFlags = new unsigned int[totalFlags];
+    // unsigned int* hostScan = new unsigned int[totalFlags];
+    // unsigned int* hostCircleIds = new unsigned int[totalFlags];
+    // cudaCheckError(cudaMemcpy(hostFlags, deviceFlags, sizeof(unsigned int) * totalFlags, cudaMemcpyDeviceToHost));
+    // cudaCheckError(cudaMemcpy(hostScan, deviceScan, sizeof(unsigned int) * totalFlags, cudaMemcpyDeviceToHost));
+    // cudaCheckError(cudaMemcpy(hostCircleIds, deviceCircleIds, sizeof(unsigned int) * totalFlags, cudaMemcpyDeviceToHost));
 
     // Print debug information
-    printf("Image dimensions: width=%d, height=%d\n", image->width, image->height);
-    printf("Number of circles: %d\n", numCircles);
-    printf("Launching kernel with grid(%d,%d,%d), block(%d,%d)\n", 
-           cellGridDim.x, cellGridDim.y, cellGridDim.z, 
-           cellBlockDim.x, cellBlockDim.y);
-    printf("Shared memory size: %d bytes\n", sharedMemSize);
-    printf("Total flags: %d\n", totalFlags);
+    // printf("Image dimensions: width=%d, height=%d\n", image->width, image->height);
+    // printf("Number of circles: %d\n", numCircles);
+    // printf("Launching kernel with grid(%d,%d,%d), block(%d,%d)\n", 
+    //        cellGridDim.x, cellGridDim.y, cellGridDim.z, 
+    //        cellBlockDim.x, cellBlockDim.y);
+    // printf("Shared memory size: %d bytes\n", sharedMemSize);
+    // printf("Total flags: %d\n", totalFlags);
 
     // Print flags and scan results for each cell and chunk
-    for (int y = 0; y < cellGridDim.y; y++) {
-        for (int x = 0; x < cellGridDim.x; x++) {
-            for (int z = 0; z < cellGridDim.z; z++) {
-                int cellIndex = (y * cellGridDim.x + x) * cellGridDim.z * SCAN_BLOCK_DIM + 
-                               z * SCAN_BLOCK_DIM;
+    // for (int y = 0; y < cellGridDim.y; y++) {
+    //     for (int x = 0; x < cellGridDim.x; x++) {
+    //         for (int z = 0; z < cellGridDim.z; z++) {
+    //             int cellIndex = (y * cellGridDim.x + x) * cellGridDim.z * SCAN_BLOCK_DIM + 
+    //                            z * SCAN_BLOCK_DIM;
                 
-                printf("Cell [%d,%d] Chunk %d:\n", x, y, z);
+    //             printf("Cell [%d,%d] Chunk %d:\n", x, y, z);
                 
-                // Print flags
-                printf("  Flags:");
-                for (int i = 0; i < SCAN_BLOCK_DIM; i++) {
-                    if (i % CELL_SIDE == 0) printf("\n    ");
-                    printf("%d ", hostFlags[cellIndex + i]);
-                }
+    //             // // Print flags
+    //             // printf("  Flags:");
+    //             // for (int i = 0; i < SCAN_BLOCK_DIM; i++) {
+    //             //     if (i % CELL_SIDE == 0) printf("\n    ");
+    //             //     printf("%d ", hostFlags[cellIndex + i]);
+    //             // }
                 
-                // Print scan results
-                printf("\n  Scan:");
-                for (int i = 0; i < SCAN_BLOCK_DIM; i++) {
-                    if (i % CELL_SIDE == 0) printf("\n    ");
-                    printf("%d ", hostScan[cellIndex + i]);
-                }
+    //             // // Print scan results
+    //             // printf("\n  Scan:");
+    //             // for (int i = 0; i < SCAN_BLOCK_DIM; i++) {
+    //             //     if (i % CELL_SIDE == 0) printf("\n    ");
+    //             //     printf("%d ", hostScan[cellIndex + i]);
+    //             // }
 
-                // Print circle IDs
-                printf("\n  Circle IDs:");
-                for (int i = 0; i < SCAN_BLOCK_DIM; i++) {
-                    if (i % CELL_SIDE == 0) printf("\n    ");
-                    printf("%d ", hostCircleIds[cellIndex + i]);
-                }
-                printf("\n\n");
-            }
-        }
-    }
+    //             // Print circle IDs
+    //             // printf("\n  Circle IDs:");
+    //             // for (int i = 0; i < SCAN_BLOCK_DIM; i++) {
+    //             //     if (i % CELL_SIDE == 0) printf("\n    ");
+    //             //     printf("%d ", hostCircleIds[cellIndex + i]);
+    //             // }
+    //             // printf("\n\n");
+    //         }
+    //     }
+    // }
 
-    // Cleanup
-    delete[] hostFlags;
-    delete[] hostScan;
-    delete[] hostCircleIds;
+    // cudaFree(deviceFlags);
+    // cudaFree(deviceScan);
+    // cudaFree(deviceCircleIds);
+    cudaFree(deviceCurrentChunk);
+
+    // Clean up debug arrays
+    // delete[] hostFlags;
+    // delete[] hostScan;
+    // delete[] hostCircleIds;
 }
